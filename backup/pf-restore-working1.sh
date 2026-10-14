@@ -1,0 +1,284 @@
+#!/bin/sh
+# =========================================================================
+# PingFederate admin post-start hook -> restore config from Google Cloud Storage
+# Version 1.0.0
+#
+# Companion to pf-backup.sh. It reads the backups that script writes and reuses
+# its env vars, bucket layout, Workload Identity auth, logging and exit codes.
+#
+# Install: mount into the PF admin pod as
+#   /opt/staging/hooks/80-post-start.sh.post   (mode 0755)
+# A ".post" hook runs right after 80-post-start.sh, which has already waited
+# for the admin console to be healthy, so the admin API is normally up here.
+#
+# What it does:
+#   1. Checks the local admin API for IdP and SP connections.
+#   2. If BOTH lists are empty, finds the newest backup for this pod in GCS.
+#   3. Downloads it and verifies its checksum against GCS's own md5.
+#   4. Imports it via the admin API. THIS OVERWRITES ALL CURRENT CONFIGURATION.
+#   5. In CLUSTERED_CONSOLE mode, replicates the restored config to the engines.
+#   The local copy is always deleted on exit, success or failure.
+#
+# SAFETY:
+#   The hook restores only when it has positively confirmed that both lists are
+#   empty. Any error during that check (API down, 401, unexpected response)
+#   means "skip", never "restore". Unlike pf-backup.sh, missing
+#   STORAGE_BUCKET_NAME / NAMESPACE are fatal (exit 10) only once a restore is
+#   actually needed, so a config gap can never fail the start of a healthy pod.
+#
+# SECURITY NOTE:
+#   data.zip contains the COMPLETE PingFederate configuration INCLUDING
+#   private keys. It is written with umask 077 and removed on exit.
+#
+# Auth: Workload Identity Federation for GKE (no keys, no token files).
+#   The pod identity needs list + get on the bucket (roles/storage.objectViewer
+#   or objectAdmin). objectCreator, which is enough for pf-backup.sh, cannot
+#   list or read objects.
+#
+# EXIT CODES:
+#   0   nothing to restore, skipped safely, or restored OK
+#   10  required configuration missing (only checked when a restore is needed)
+#   30  could not get a GCS access token
+#   31  GCS access token was empty
+#   32  no backup found (or listing the bucket failed)
+#   40  download from GCS failed
+#   41  checksum mismatch (download corrupt)
+#   50  admin API configArchive/import failed
+#   51  admin API cluster/replicate failed
+#   (Unverified: what the Ping entrypoint does when a .post hook exits
+#   non-zero. It may restart the container, which would retry the restore.)
+#
+# ENV VARS (same as pf-backup.sh; nothing new to configure):
+#   Required (only when a restore is needed):
+#     STORAGE_BUCKET_NAME      — GCS bucket holding the backups
+#     NAMESPACE                — the namespace the PF workload is deployed in
+#     PING_IDENTITY_PASSWORD   — PF admin API password (already injected by Helm)
+#   Optional (have sensible defaults):
+#     PF_ADMIN_BACKUP_URL      — PF admin API base URL       (default: https://localhost:9999)
+#     PF_ADMIN_USER            — admin API username           (default: Administrator)
+#     BACKUP_ROOT              — local temp directory         (default: /opt/pingfederate-backup)
+#     OBJECT_PREFIX            — folder prefix in the bucket  (default: pingfederate)
+#   Set by the Ping image:
+#     OPERATIONAL_MODE         — CLUSTERED_CONSOLE turns on the replicate step
+#
+# BUCKET LAYOUT (as written by pf-backup.sh):
+#   <OBJECT_PREFIX>/<HOST>-<NAMESPACE>/pf-backup-<ts>/data-<ts>.zip
+#
+# POSIX sh. Requires: curl, md5sum, od, sed, base64 (BusyBox), grep, sort, tail.
+# NOTE: same image as pf-backup.sh, so BusyBox base64 ("base64 -d") applies here too.
+# =========================================================================
+
+set -eu
+umask 077   # the archive holds private keys: keep files owner-only
+
+log() { echo "[$(date -u +%H:%M:%SZ)] $*" >&2; }
+
+CURRENT_STEP="startup"
+RESTORE_DIR=""   # set in STEP 5; removed by the trap below on every exit
+trap '
+code=$?
+if [ -n "$RESTORE_DIR" ]; then rm -rf "$RESTORE_DIR"; fi
+if [ "$code" -eq 0 ]; then
+    log "SUCCESS: finished (exit 0)"
+else
+    log "FAILED during: ${CURRENT_STEP} (exit ${code})"
+fi
+' EXIT
+
+# -- Helper: GCS access token via Workload Identity (same as pf-backup.sh) -----
+get_access_token() {
+    resp="$(curl -sf --retry 5 --retry-delay 2 --connect-timeout 5 \
+        -H 'Metadata-Flavor: Google' \
+        'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token')" || {
+        log "  cannot reach the metadata server. Check:"
+        log "   (a) Workload Identity is enabled and the KSA is bound;"
+        log "   (b) if a mesh sidecar is present, exclude 169.254.169.254/32."
+        return 1
+    }
+    printf '%s' "$resp" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+# -- Helper: PF admin API call ---------------------------------------------------
+# -k: accept the self-signed cert on localhost
+# X-XSRF-Header: required by PF to prevent CSRF
+# -S: keep curl's error message (it includes the HTTP status) when -s is set
+pf_api() {
+    curl -sSk --retry 3 --retry-delay 5 --connect-timeout 15 \
+        --user "${PF_ADMIN_USER}:${PING_IDENTITY_PASSWORD}" \
+        --header 'X-XSRF-Header: PingFederate' "$@"
+}
+
+# -- Helper: GCS JSON API call (same retry/timeout flags as pf-backup.sh) --------
+# -f makes HTTP errors fail the command.
+gcs_api() {
+    curl -sSf --retry 5 --retry-delay 2 --connect-timeout 10 \
+        -H "Authorization: Bearer ${TOKEN}" "$@"
+}
+
+# -- Helper: is this connection list empty? --------------------------------------
+# True only if the API answers HTTP 200 AND the list is empty.
+# page and numberPerPage must be sent together: PF answers HTTP 422
+# "paged_results_parameter_missing" if only one is given. One item per page is
+# enough, since we only care whether the list is empty.
+# "Empty" means the body, with whitespace stripped, is {} or STARTS WITH
+# {"items":[]. Anchoring at the start means an "items":[] nested inside a real
+# connection can never be mistaken for an empty list.
+# Anything else (HTTP error, non-empty list, odd body) returns false => skip.
+# No -f here on purpose: -f would hide PF's error body. PF error bodies carry a
+# resultId and message (e.g. 422 paged_results_parameter_missing), so on a
+# non-200 we log the status code plus the start of that body.
+is_empty() {
+    resp="$(pf_api -w '\n%{http_code}' "${API}/$1?page=1&numberPerPage=1")" \
+        || { log "  $1: could not reach the admin API"; return 1; }
+    code="$(printf '%s' "$resp" | tail -n 1)"
+    body="$(printf '%s' "$resp" | sed '$d')"
+    if [ "$code" != 200 ]; then
+        log "  $1: admin API returned HTTP ${code}: $(printf '%s' "$body" | tr -d '\n' | cut -c1-300)"
+        return 1
+    fi
+    case "$(printf '%s' "$body" | tr -d ' \n')" in
+        '{}' | '{"items":[]'*) log "  $1: empty"; return 0 ;;
+    esac
+    log "  $1: has connections or unexpected response"
+    return 1
+}
+
+# -- Helper: download from GCS and verify its checksum ---------------------------
+# Mirror image of upload_and_verify in pf-backup.sh: compare the md5 GCS reports
+# for the object against the md5 of the local file. Important here because the
+# import that follows overwrites everything.
+download_and_verify() {
+    _object_name="$1"   # already URL-encoded ('/' -> %2F)
+    _local_path="$2"
+    _filename="$(basename "$_local_path")"
+
+    log "  downloading ${_filename}"
+    gcs_api -o "$_local_path" "${GCS}/${_object_name}?alt=media" \
+        || { log "  download failed for ${_filename}"; exit 40; }
+    [ -s "$_local_path" ] || { log "  downloaded file is empty"; exit 40; }
+
+    _meta="$(gcs_api "${GCS}/${_object_name}?fields=md5Hash")" \
+        || { log "  could not read object metadata"; exit 40; }
+
+    _local_md5="$(md5sum "$_local_path" | cut -d' ' -f1)"
+    _remote_b64="$(printf '%s' "$_meta" | sed -n 's/.*"md5Hash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    _remote_md5="$(printf '%s' "$_remote_b64" | base64 -d | od -An -tx1 | tr -d ' \n')"
+
+    if [ "$_local_md5" = "$_remote_md5" ]; then
+        log "  verified ${_filename} (md5: ${_local_md5})"
+    else
+        log "  CHECKSUM MISMATCH for ${_filename}"
+        log "  local:  ${_local_md5}"
+        log "  remote: ${_remote_md5} (base64: ${_remote_b64})"
+        exit 41
+    fi
+}
+
+# =========================================================================
+log "===== PingFederate config restore hook: starting ====="
+
+# -- STEP 1: Configuration ------------------------------------------------
+CURRENT_STEP="STEP 1: configuration"
+log "STEP 1: reading configuration"
+
+STORAGE_BUCKET_NAME="${STORAGE_BUCKET_NAME:-}"   # required only if a restore is needed (STEP 3)
+NAMESPACE="${NAMESPACE:-}"                       # required only if a restore is needed (STEP 3)
+
+BACKUP_ROOT="${BACKUP_ROOT:-/opt/pingfederate-backup}"
+OBJECT_PREFIX="${OBJECT_PREFIX:-pingfederate}"
+
+# PF admin API settings
+PF_ADMIN_BACKUP_URL="${PF_ADMIN_BACKUP_URL:-https://localhost:9999}"
+PF_ADMIN_USER="${PF_ADMIN_USER:-Administrator}"
+# PING_IDENTITY_PASSWORD is already injected into the pod by Helm. If it is
+# missing, the check in STEP 2 is rejected by the admin API and the hook skips safely.
+PING_IDENTITY_PASSWORD="${PING_IDENTITY_PASSWORD:-}"
+API="${PF_ADMIN_BACKUP_URL}/pf-admin-api/v1"
+
+log "  admin=${PF_ADMIN_BACKUP_URL} user=${PF_ADMIN_USER}"
+log "OK STEP 1: configuration read"
+
+# -- STEP 2: Are there any connections? -----------------------------------
+# Restore only if BOTH the SP and IdP connection lists are empty.
+CURRENT_STEP="STEP 2: check connections"
+log "STEP 2: checking IdP and SP connections via admin API"
+
+is_empty idp/spConnections && is_empty sp/idpConnections \
+    || { log "OK STEP 2: nothing to restore (connections present, or a check failed; see above)"; exit 0; }
+
+log "OK STEP 2: no IdP or SP connections found; restoring from backup"
+
+# -- STEP 3: Required config + GCS access token ---------------------------
+CURRENT_STEP="STEP 3: GCS access"
+log "STEP 3: checking configuration and requesting access token via Workload Identity"
+
+[ -n "$STORAGE_BUCKET_NAME" ] || { log "  STORAGE_BUCKET_NAME is not set"; exit 10; }
+[ -n "$NAMESPACE" ] || { log "  NAMESPACE is not set"; exit 10; }
+GCS="https://storage.googleapis.com/storage/v1/b/${STORAGE_BUCKET_NAME}/o"
+
+TOKEN="$(get_access_token)" || exit 30
+[ -n "$TOKEN" ] || { log "  access token was empty"; exit 31; }
+
+log "OK STEP 3: access token retrieved (valid ~1h)"
+
+# -- STEP 4: Find the newest backup for this pod --------------------------
+# HOST and the prefix are built exactly as pf-backup.sh builds DEST_PREFIX, so
+# they match by construction (including the trailing '-' that `hostname`'s
+# newline becomes, which is why the folder reads "<host>--<namespace>").
+# Folder names embed pf-backup-YYYY-MM-DD_HH-MM-SS, so the last name in sorted
+# order is the newest. One list call returns up to 1000 objects; keep a bucket
+# lifecycle rule so old backups age out.
+CURRENT_STEP="STEP 4: find newest backup"
+HOST="$(hostname 2>/dev/null | tr -c 'A-Za-z0-9._-' '-' || echo pf)"
+SRC_PREFIX="${OBJECT_PREFIX}/${HOST}-${NAMESPACE}/pf-backup-"
+log "STEP 4: listing gs://${STORAGE_BUCKET_NAME}/${SRC_PREFIX}*"
+
+OBJECT_PATH="$(gcs_api -G "$GCS" --data-urlencode "prefix=${SRC_PREFIX}" --data-urlencode 'fields=items/name' \
+    | grep -o '"name": *"[^"]*\.zip"' | cut -d'"' -f4 \
+    | grep -E '/data-[^/]+\.zip$' | sort | tail -n 1)"
+[ -n "$OBJECT_PATH" ] || { log "  no backup found under gs://${STORAGE_BUCKET_NAME}/${SRC_PREFIX}* (or listing failed; see above)"; exit 32; }
+
+log "OK STEP 4: newest backup is ${OBJECT_PATH}"
+
+# -- STEP 5: Download and verify -------------------------------------------
+# Ping docs: the archive must be named data.zip to import. BACKUP_ROOT is the
+# same local directory pf-backup.sh already writes to, so it is known-writable.
+# The trap removes RESTORE_DIR on every exit.
+CURRENT_STEP="STEP 5: download and verify"
+log "STEP 5: downloading backup"
+
+TIMESTAMP="$(date -u +%Y-%m-%d_%H-%M-%S)"
+RESTORE_DIR="${BACKUP_ROOT}/pf-restore-${TIMESTAMP}"
+DATA_ZIP="${RESTORE_DIR}/data.zip"
+mkdir -p "$RESTORE_DIR"
+
+OBJECT_NAME="$(printf '%s' "$OBJECT_PATH" | sed 's|/|%2F|g')"
+download_and_verify "$OBJECT_NAME" "$DATA_ZIP"
+
+log "OK STEP 5: downloaded and verified"
+
+# -- STEP 6: Import the config archive ------------------------------------
+# NOTE: sends the zip as a multipart form field "file". Confirm against
+# /pf-admin-api/v1/swagger.json (see `consumes` under /configArchive/import);
+# if the endpoint expects a raw body instead, change this one -F line.
+CURRENT_STEP="STEP 6: import config archive"
+log "STEP 6: importing config archive via admin API (overwrites all configuration)"
+
+pf_api -f -F "file=@${DATA_ZIP}" "${API}/configArchive/import" >/dev/null \
+    || { log "  configArchive/import failed"; exit 50; }
+
+log "OK STEP 6: config archive imported"
+
+# -- STEP 7: Push the restored config to the engines ----------------------
+# Same call Ping's own 85-import-configuration.sh makes after an import.
+CURRENT_STEP="STEP 7: cluster replicate"
+if [ "${OPERATIONAL_MODE:-}" = CLUSTERED_CONSOLE ]; then
+    log "STEP 7: replicating configuration to the cluster"
+    pf_api -f -X POST -H 'Content-Type: application/json' "${API}/cluster/replicate" >/dev/null \
+        || { log "  cluster/replicate failed"; exit 51; }
+    log "OK STEP 7: replicated"
+else
+    log "STEP 7: skipped (OPERATIONAL_MODE=${OPERATIONAL_MODE:-unset}, not CLUSTERED_CONSOLE)"
+fi
+
+log "restore complete from ${OBJECT_PATH}"
