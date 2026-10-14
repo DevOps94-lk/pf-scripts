@@ -375,8 +375,15 @@ log "OK STEP 6: downloaded and verified"
 CURRENT_STEP="STEP 7: import config archive"
 log "STEP 7: importing config archive via admin API (overwrites all configuration)"
 
-pf_api -f -F "file=@${DATA_ZIP}" "${API}/configArchive/import" >/dev/null \
-    || { log "  configArchive/import failed"; exit 50; }
+# No -f on purpose: -f would hide PF's error body (e.g. a 422 validation message).
+resp="$(pf_api -w '\n%{http_code}' -F "file=@${DATA_ZIP}" "${API}/configArchive/import")" \
+    || { log "  configArchive/import: could not reach the admin API"; exit 50; }
+code="$(printf '%s' "$resp" | tail -n 1)"
+case "$code" in
+    2??) ;;
+    *) log "  configArchive/import returned HTTP ${code}: $(printf '%s' "$resp" | sed '$d' | tr -d '\n' | cut -c1-800)"
+       exit 50 ;;
+esac
 
 log "OK STEP 7: config archive imported"
 
