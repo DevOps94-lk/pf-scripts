@@ -14,6 +14,14 @@ configMaps:
         #   3. Verifies the upload by comparing GCS's checksum against the local file.
         #   4. Deletes the local copy.
         #
+        # SAFETY CHECKS (so a wiped PingFederate never becomes the newest backup):
+        #   - Before exporting: refuse if there are no IdP or SP connections (exit 24).
+        #   - After exporting: the file must be a zip with content (exit 22) and at
+        #     least MIN_ARCHIVE_BYTES big (exit 23).
+        #   Why: a wiped PF still answers the export call, with an empty or near-empty
+        #   archive. Uploading it would make it the NEWEST backup, and the restore hook
+        #   always restores the newest one.
+        #
         # SECURITY NOTE:
         #   data.zip contains the COMPLETE PingFederate configuration INCLUDING
         #   private keys. Ensure the target GCS bucket has CMEK (or equivalent)
@@ -29,6 +37,9 @@ configMaps:
         #   10  required configuration missing
         #   20  PF admin API export failed
         #   21  exported file is empty or missing
+        #   22  exported file is not a zip with content (e.g. an empty zip or an error body)
+        #   23  exported file is smaller than MIN_ARCHIVE_BYTES (looks wiped or corrupt)
+        #   24  refused: no IdP or SP connections found (PingFederate looks wiped or new)
         #   30  could not get a GCS access token
         #   31  GCS access token was empty
         #   40  upload to GCS failed
@@ -45,6 +56,8 @@ configMaps:
         #     PF_ADMIN_USER            — admin API username           (default: Administrator)
         #     BACKUP_ROOT              — local temp directory         (default: /opt/pingfederate-backup)
         #     OBJECT_PREFIX            — folder prefix in the bucket  (default: pingfederate)
+        #     MIN_ARCHIVE_BYTES        — smallest archive accepted    (default: 10240)
+        #                                Set to roughly half the size of a healthy archive.
         #
         # POSIX sh. Requires: curl, md5sum, od, sed, base64 (BusyBox).
         # NOTE: this image ships BusyBox base64 (standard "base64 -d" syntax).
@@ -77,6 +90,24 @@ configMaps:
                 return 1
             }
             printf '%s' "$resp" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+        }
+
+        # -- Helper: is this connection list positively empty? ---------------------
+        # True only if the admin API answers HTTP 200 (-f fails on any other status) AND
+        # the list is empty. Any other outcome (error, connections present, odd body)
+        # returns false, so this can never block a backup on its own.
+        # page and numberPerPage must be sent together, otherwise PF answers HTTP 422.
+        # "Empty" means the body, without whitespace, is {} or STARTS WITH {"items":[]
+        # so a nested "items":[] cannot fool it.
+        list_is_empty() {
+            _body="$(curl -sfk --retry 3 --retry-delay 5 --connect-timeout 15 \
+                --header 'X-XSRF-Header: PingFederate' \
+                --user "${PF_ADMIN_USER}:${PING_IDENTITY_PASSWORD}" \
+                "${PF_ADMIN_BACKUP_URL}/pf-admin-api/v1/$1?page=1&numberPerPage=1")" || return 1
+            case "$(printf '%s' "$_body" | tr -d ' \n')" in
+                '{}' | '{"items":[]'*) return 0 ;;
+            esac
+            return 1
         }
 
         # -- Helper: upload a file to GCS and verify its checksum ------------------
@@ -123,6 +154,7 @@ configMaps:
 
         BACKUP_ROOT="${BACKUP_ROOT:-/opt/pingfederate-backup}"
         OBJECT_PREFIX="${OBJECT_PREFIX:-pingfederate}"
+        MIN_ARCHIVE_BYTES="${MIN_ARCHIVE_BYTES:-10240}"   # a wiped PF exports a far smaller archive
 
         # PF admin API settings
         PF_ADMIN_BACKUP_URL="${PF_ADMIN_BACKUP_URL:-https://localhost:9999}"
@@ -152,6 +184,17 @@ configMaps:
         CURRENT_STEP="STEP 2: export config archive"
         log "STEP 2: exporting config archive via admin API"
 
+        # Pre-check: refuse when BOTH the SP and IdP connection lists are positively
+        # empty. That is what a wiped, reset or brand-new PingFederate looks like, and
+        # exporting it would create an empty "newest backup". Anything else (connections
+        # present, API error, odd response) carries on; an API error makes the export
+        # below fail by itself.
+        if list_is_empty idp/spConnections && list_is_empty sp/idpConnections; then
+            log "  no IdP or SP connections found: this looks like a wiped or new PingFederate"
+            log "  refusing to back it up, so the last good backup stays the newest"
+            exit 24
+        fi
+
         mkdir -p "$BACKUP_DIR"
         curl -sk --location --retry 3 --retry-delay 5 --connect-timeout 15 \
             --request GET "${PF_ADMIN_BACKUP_URL}/pf-admin-api/v1/configArchive/export" \
@@ -168,6 +211,29 @@ configMaps:
         fi
 
         FILESIZE="$(wc -c < "$DATA_ZIP" | tr -d ' ')"
+
+        # A zip with content starts with the bytes 50 4b 03 04 ("PK" + local file header).
+        # An EMPTY zip starts with 50 4b 05 06 instead, and an error response (for
+        # example HTTP 403 license_agreement_not_accepted on a wiped node) is JSON. So
+        # this also catches the cases where the export call "succeeded" but is not a
+        # real archive. The first 4 bytes come from the same od call used for the
+        # checksum below.
+        ZIP_MAGIC="$(od -An -tx1 "$DATA_ZIP" | sed -n '1s/^ *\(..\) \(..\) \(..\) \(..\).*/\1\2\3\4/p')"
+        if [ "$ZIP_MAGIC" != "504b0304" ]; then
+            log "  exported file is not a zip with content (${FILESIZE} bytes, first bytes: ${ZIP_MAGIC:-none})"
+            log "  start of response: $(tr -d '\n' < "$DATA_ZIP" | cut -c1-300)"
+            rm -rf "$BACKUP_DIR"
+            exit 22
+        fi
+
+        # Size floor: a wiped PF can still produce a small but valid-looking zip.
+        if [ "$FILESIZE" -lt "$MIN_ARCHIVE_BYTES" ]; then
+            log "  archive is only ${FILESIZE} bytes (minimum ${MIN_ARCHIVE_BYTES}); looks wiped or corrupt"
+            log "  if this size is normal for your config, lower MIN_ARCHIVE_BYTES"
+            rm -rf "$BACKUP_DIR"
+            exit 23
+        fi
+
         log "OK STEP 2: config archive exported (${FILESIZE} bytes)"
 
         # -- STEP 3: Get GCS access token -----------------------------------------

@@ -1,0 +1,256 @@
+#!/bin/sh
+# =========================================================================
+# PingFederate config archive export -> Google Cloud Storage
+# Version 1.0.0  
+#
+# What it does:
+#   1. Exports a config archive (data.zip) via the PF admin API.
+#   2. Uploads it to GCS.
+#   3. Verifies the upload by comparing GCS's checksum against the local file.
+#   4. Deletes the local copy.
+#
+# SAFETY CHECKS (so a wiped PingFederate never becomes the newest backup):
+#   - Before exporting: refuse if there are no IdP or SP connections (exit 24).
+#   - After exporting: the file must be a zip with content (exit 22) and at
+#     least MIN_ARCHIVE_BYTES big (exit 23).
+#   Why: a wiped PF still answers the export call, with an empty or near-empty
+#   archive. Uploading it would make it the NEWEST backup, and the restore hook
+#   always restores the newest one.
+#
+# SECURITY NOTE:
+#   data.zip contains the COMPLETE PingFederate configuration INCLUDING
+#   private keys. Ensure the target GCS bucket has CMEK (or equivalent)
+#   encryption at rest, and restrict bucket read access to authorized
+#   principals only.
+#   Docs: https://docs.pingidentity.com/pingfederate/13.1/administrators_reference_guide/pf_exporting_archive.html
+#
+# Auth: Workload Identity Federation for GKE (no keys, no token files).
+# Docs: https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity
+#
+# EXIT CODES:
+#   0   success
+#   10  required configuration missing
+#   20  PF admin API export failed
+#   21  exported file is empty or missing
+#   22  exported file is not a zip with content (e.g. an empty zip or an error body)
+#   23  exported file is smaller than MIN_ARCHIVE_BYTES (looks wiped or corrupt)
+#   24  refused: no IdP or SP connections found (PingFederate looks wiped or new)
+#   30  could not get a GCS access token
+#   31  GCS access token was empty
+#   40  upload to GCS failed
+#   41  checksum mismatch (upload corrupt)
+#   50  local cleanup failed
+#
+# ENV VARS:
+#   Required (script exits 10 if missing):
+#     STORAGE_BUCKET_NAME      — target GCS bucket
+#     PING_IDENTITY_PASSWORD   — PF admin API password (already injected by Helm)
+#     NAMESPACE                - The namespace the PF workload is deployed in
+#   Optional (have sensible defaults):
+#     PF_ADMIN_BACKUP_URL      — PF admin API base URL       (default: https://localhost:9999)
+#     PF_ADMIN_USER            — admin API username           (default: Administrator)
+#     BACKUP_ROOT              — local temp directory         (default: /opt/pingfederate-backup)
+#     OBJECT_PREFIX            — folder prefix in the bucket  (default: pingfederate)
+#     MIN_ARCHIVE_BYTES        — smallest archive accepted    (default: 10240)
+#                                Set to roughly half the size of a healthy archive.
+#
+# POSIX sh. Requires: curl, md5sum, od, sed, base64 (BusyBox).
+# NOTE: this image ships BusyBox base64 (standard "base64 -d" syntax).
+# The PD image is different — it ships PingIdentity's own base64 which
+# uses "base64 decode -d <string>". Do NOT copy this line to the PD script.
+# =========================================================================
+
+set -eu
+
+log() { echo "[$(date -u +%H:%M:%SZ)] $*" >&2; }
+
+CURRENT_STEP="startup"
+trap '
+code=$?
+if [ "$code" -eq 0 ]; then
+    log "SUCCESS: all steps completed (exit 0)"
+else
+    log "FAILED during: ${CURRENT_STEP} (exit ${code})"
+fi
+' EXIT
+
+# -- Helper: GCS access token via Workload Identity ------------------------
+get_access_token() {
+    resp="$(curl -sf --retry 5 --retry-delay 2 --connect-timeout 5 \
+        -H 'Metadata-Flavor: Google' \
+        'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token')" || {
+        log "  cannot reach the metadata server. Check:"
+        log "   (a) Workload Identity is enabled and the KSA is bound;"
+        log "   (b) if a mesh sidecar is present, exclude 169.254.169.254/32."
+        return 1
+    }
+    printf '%s' "$resp" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+# -- Helper: is this connection list positively empty? ---------------------
+# True only if the admin API answers HTTP 200 (-f fails on any other status) AND
+# the list is empty. Any other outcome (error, connections present, odd body)
+# returns false, so this can never block a backup on its own.
+# page and numberPerPage must be sent together, otherwise PF answers HTTP 422.
+# "Empty" means the body, without whitespace, is {} or STARTS WITH {"items":[]
+# so a nested "items":[] cannot fool it.
+list_is_empty() {
+    _body="$(curl -sfk --retry 3 --retry-delay 5 --connect-timeout 15 \
+        --header 'X-XSRF-Header: PingFederate' \
+        --user "${PF_ADMIN_USER}:${PING_IDENTITY_PASSWORD}" \
+        "${PF_ADMIN_BACKUP_URL}/pf-admin-api/v1/$1?page=1&numberPerPage=1")" || return 1
+    case "$(printf '%s' "$_body" | tr -d ' \n')" in
+        '{}' | '{"items":[]'*) return 0 ;;
+    esac
+    return 1
+}
+
+# -- Helper: upload a file to GCS and verify its checksum ------------------
+upload_and_verify() {
+    _local_path="$1"
+    _object_name="$2"
+    _filename="$(basename "$_local_path")"
+
+    log "  uploading ${_filename}"
+    _response="$(curl -sf --retry 5 --retry-delay 2 --connect-timeout 10 \
+        -X POST \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@${_local_path}" \
+        "https://storage.googleapis.com/upload/storage/v1/b/${STORAGE_BUCKET_NAME}/o?uploadType=media&name=${_object_name}")" \
+        || { log "  upload failed for ${_filename}"; exit 40; }
+
+    _local_md5="$(md5sum "$_local_path" | cut -d' ' -f1)"
+    _remote_b64="$(printf '%s' "$_response" | sed -n 's/.*"md5Hash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    _remote_md5="$(printf '%s' "$_remote_b64" | base64 -d | od -An -tx1 | tr -d ' \n')"
+
+    if [ "$_local_md5" = "$_remote_md5" ]; then
+        log "  verified ${_filename} (md5: ${_local_md5})"
+    else
+        log "  CHECKSUM MISMATCH for ${_filename}"
+        log "  local:  ${_local_md5}"
+        log "  remote: ${_remote_md5} (base64: ${_remote_b64})"
+        exit 41
+    fi
+}
+
+# =========================================================================
+log "===== PingFederate config backup: starting ====="
+
+# -- STEP 1: Configuration ------------------------------------------------
+CURRENT_STEP="STEP 1: configuration"
+log "STEP 1: reading configuration"
+
+STORAGE_BUCKET_NAME="${STORAGE_BUCKET_NAME:-}"
+[ -n "$STORAGE_BUCKET_NAME" ] || { log "  STORAGE_BUCKET_NAME is not set"; exit 10; }
+
+NAMESPACE="${NAMESPACE:-}"
+[ -n "$NAMESPACE" ] || { log "  NAMESPACE is not set"; exit 10; }
+
+BACKUP_ROOT="${BACKUP_ROOT:-/opt/pingfederate-backup}"
+OBJECT_PREFIX="${OBJECT_PREFIX:-pingfederate}"
+MIN_ARCHIVE_BYTES="${MIN_ARCHIVE_BYTES:-10240}"   # a wiped PF exports a far smaller archive
+
+# PF admin API settings
+PF_ADMIN_BACKUP_URL="${PF_ADMIN_BACKUP_URL:-https://localhost:9999}"
+PF_ADMIN_USER="${PF_ADMIN_USER:-Administrator}"
+# PING_IDENTITY_PASSWORD is already injected into the pod by Helm.
+[ -n "${PING_IDENTITY_PASSWORD:-}" ] \
+    || { log "  PING_IDENTITY_PASSWORD env var is not set"; exit 10; }
+
+# Human-readable timestamp, filesystem-safe (no colons or spaces).
+# Example: 2026-09-23_11-55-46
+TIMESTAMP="$(date -u +%Y-%m-%d_%H-%M-%S)"
+HOST="$(hostname 2>/dev/null | tr -c 'A-Za-z0-9._-' '-' || echo pf)"
+BACKUP_DIR="${BACKUP_ROOT}/pf-backup-${TIMESTAMP}"
+DATA_ZIP="${BACKUP_DIR}/data-${TIMESTAMP}.zip"
+DEST_PREFIX="${OBJECT_PREFIX}/${HOST}-${NAMESPACE}/pf-backup-${TIMESTAMP}"
+
+log "  bucket=${STORAGE_BUCKET_NAME} admin=${PF_ADMIN_BACKUP_URL}"
+log "OK STEP 1: configuration valid"
+
+# -- STEP 2: Export config archive via PF admin API ------------------------
+# Calls the PF admin REST API to generate and download the current
+# configuration archive (data.zip). This contains the COMPLETE config
+# including private keys — handle with care.
+# -k: accept the self-signed cert on localhost
+# X-XSRF-Header: required by PF to prevent CSRF
+# Docs: https://docs.pingidentity.com/pingfederate/13.1/administrators_reference_guide/pf_exporting_archive.html
+CURRENT_STEP="STEP 2: export config archive"
+log "STEP 2: exporting config archive via admin API"
+
+# Pre-check: refuse when BOTH the SP and IdP connection lists are positively
+# empty. That is what a wiped, reset or brand-new PingFederate looks like, and
+# exporting it would create an empty "newest backup". Anything else (connections
+# present, API error, odd response) carries on; an API error makes the export
+# below fail by itself.
+if list_is_empty idp/spConnections && list_is_empty sp/idpConnections; then
+    log "  no IdP or SP connections found: this looks like a wiped or new PingFederate"
+    log "  refusing to back it up, so the last good backup stays the newest"
+    exit 24
+fi
+
+mkdir -p "$BACKUP_DIR"
+curl -sk --location --retry 3 --retry-delay 5 --connect-timeout 15 \
+    --request GET "${PF_ADMIN_BACKUP_URL}/pf-admin-api/v1/configArchive/export" \
+    --header 'X-XSRF-Header: PingFederate' \
+    --header 'Content-Type: application/json' \
+    --user "${PF_ADMIN_USER}:${PING_IDENTITY_PASSWORD}" \
+    --output "$DATA_ZIP" \
+    || { log "  admin API export failed"; exit 20; }
+
+# Verify the export produced a real file (not an error page or empty response)
+if [ ! -s "$DATA_ZIP" ]; then
+    log "  exported file is empty or missing"
+    exit 21
+fi
+
+FILESIZE="$(wc -c < "$DATA_ZIP" | tr -d ' ')"
+
+# A zip with content starts with the bytes 50 4b 03 04 ("PK" + local file header).
+# An EMPTY zip starts with 50 4b 05 06 instead, and an error response (for
+# example HTTP 403 license_agreement_not_accepted on a wiped node) is JSON. So
+# this also catches the cases where the export call "succeeded" but is not a
+# real archive. The first 4 bytes come from the same od call used for the
+# checksum below.
+ZIP_MAGIC="$(od -An -tx1 "$DATA_ZIP" | sed -n '1s/^ *\(..\) \(..\) \(..\) \(..\).*/\1\2\3\4/p')"
+if [ "$ZIP_MAGIC" != "504b0304" ]; then
+    log "  exported file is not a zip with content (${FILESIZE} bytes, first bytes: ${ZIP_MAGIC:-none})"
+    log "  start of response: $(tr -d '\n' < "$DATA_ZIP" | cut -c1-300)"
+    rm -rf "$BACKUP_DIR"
+    exit 22
+fi
+
+# Size floor: a wiped PF can still produce a small but valid-looking zip.
+if [ "$FILESIZE" -lt "$MIN_ARCHIVE_BYTES" ]; then
+    log "  archive is only ${FILESIZE} bytes (minimum ${MIN_ARCHIVE_BYTES}); looks wiped or corrupt"
+    log "  if this size is normal for your config, lower MIN_ARCHIVE_BYTES"
+    rm -rf "$BACKUP_DIR"
+    exit 23
+fi
+
+log "OK STEP 2: config archive exported (${FILESIZE} bytes)"
+
+# -- STEP 3: Get GCS access token -----------------------------------------
+CURRENT_STEP="STEP 3: get access token"
+log "STEP 3: requesting access token via Workload Identity"
+
+TOKEN="$(get_access_token)" || exit 30
+[ -n "$TOKEN" ] || { log "  access token was empty"; exit 31; }
+
+log "OK STEP 3: access token retrieved (valid ~1h)"
+
+# -- STEP 4: Upload to GCS and verify -------------------------------------
+CURRENT_STEP="STEP 4: upload and verify"
+log "STEP 4: uploading to gs://${STORAGE_BUCKET_NAME}/${DEST_PREFIX}/"
+
+OBJECT_NAME="$(printf '%s' "${DEST_PREFIX}/$(basename "$DATA_ZIP")" | sed 's|/|%2F|g')"
+upload_and_verify "$DATA_ZIP" "$OBJECT_NAME"
+
+log "OK STEP 4: uploaded and verified"
+
+# -- STEP 5: Local cleanup -------------------------------------------------
+CURRENT_STEP="STEP 5: local cleanup"
+log "STEP 5: deleting local copy"
+rm -rf "$BACKUP_DIR" || { log "  cleanup failed"; exit 50; }
+log "OK STEP 5: local copy deleted"
