@@ -12,6 +12,8 @@ configMaps:
         #
         # Install: mount into the PF admin pod as
         #   /opt/staging/hooks/80-post-start.sh.post   (mode 0755)
+        # and set ENABLE_AUTOMATIC_PF_BACKUP_RESTORE=true in the pod's environment via Helm;
+        # without it the hook does nothing (see ENABLE SWITCH).
         # A ".post" hook runs right after 80-post-start.sh, which has already waited
         # for the admin console to be healthy, so the admin API is normally up here.
         #
@@ -48,7 +50,8 @@ configMaps:
         #   license agreement and creates a TEMPORARY local admin "administrator" with
         #   PING_IDENTITY_PASSWORD. If the instance uses external (LDAP) admin
         #   authentication, delete that account in the admin console after the restore
-        #   (the log reminds you). No Helm change is needed.
+        #   (the log reminds you). CREATE_INITIAL_ADMIN_USER needs no change; the only Helm
+        #   setting this hook needs is the enable switch (see ENABLE SWITCH).
         #
         # SECURITY NOTE:
         #   data.zip contains the COMPLETE PingFederate configuration INCLUDING
@@ -60,7 +63,7 @@ configMaps:
         #   list or read objects.
         #
         # EXIT CODES:
-        #   0   nothing to restore, skipped safely, no backup found (WARN), or restored OK
+        #   0   disabled (switch not "true"), nothing to restore, skipped safely, no backup found (WARN), or restored OK
         #   10  required configuration missing (only checked when a restore is needed)
         #   30  could not get a GCS access token
         #   31  GCS access token was empty
@@ -77,7 +80,15 @@ configMaps:
         #   attempted and failed. Having no backup is NOT an error, so a brand-new
         #   environment never crash-loops.
         #
-        # ENV VARS (same as pf-backup.sh; nothing new to configure):
+        # ENABLE SWITCH:
+        #   The hook does anything only when ENABLE_AUTOMATIC_PF_BACKUP_RESTORE is exactly
+        #   "true" (inject it via Helm). Any other value, including unset, logs one line
+        #   and exits 0 before touching anything, so without the variable the hook is a
+        #   no-op. This is the one variable this hook needs beyond pf-backup.sh's.
+        #
+        # ENV VARS (same as pf-backup.sh, plus the enable switch):
+        #   Always required (set via Helm):
+        #     ENABLE_AUTOMATIC_PF_BACKUP_RESTORE — "true" enables the hook; anything else skips (exit 0)
         #   Required (only when a restore is needed):
         #     STORAGE_BUCKET_NAME      — GCS bucket holding the backups
         #     NAMESPACE                — the namespace the PF workload is deployed in
@@ -246,6 +257,14 @@ configMaps:
 
         # =========================================================================
         log "===== PingFederate config restore hook: starting ====="
+
+        # -- Gate: run only when enabled via Helm ---------------------------------
+        # Exactly "true" enables the hook. Anything else (unset, "false", "TRUE", ...)
+        # skips with exit 0, so Ping continues normally and nothing is checked or restored.
+        if [ "${ENABLE_AUTOMATIC_PF_BACKUP_RESTORE:-}" != "true" ]; then
+            log "ENABLE_AUTOMATIC_PF_BACKUP_RESTORE is not 'true' (value: '${ENABLE_AUTOMATIC_PF_BACKUP_RESTORE:-}'); automatic restore is disabled, skipping"
+            exit 0
+        fi
 
         # -- STEP 1: Configuration ------------------------------------------------
         CURRENT_STEP="STEP 1: configuration"
